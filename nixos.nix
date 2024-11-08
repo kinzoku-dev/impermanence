@@ -6,12 +6,16 @@ let
     attrValues
     zipAttrsWith
     flatten
+    mkAfter
     mkOption
     mkDefault
+    mkIf
+    mkMerge
     mapAttrsToList
     types
     foldl'
     unique
+    concatMap
     concatMapStrings
     listToAttrs
     escapeShellArg
@@ -22,22 +26,23 @@ let
     filterAttrs
     concatStringsSep
     concatMapStringsSep
-    isString
     catAttrs
     optional
-    literalExpression
     optionalString
+    literalExpression
     elem
     mapAttrs
+    intersectLists
+    any
+    id
     ;
 
   inherit (utils)
     escapeSystemdPath
+    fsNeededForBoot
     ;
 
   inherit (pkgs.callPackage ./lib.nix { })
-    splitPath
-    dirListToPath
     concatPaths
     duplicates
     parentsOf
@@ -45,13 +50,18 @@ let
 
   cfg = config.environment.persistence;
   users = config.users.users;
-  allPersistentStoragePaths = { directories = [ ]; files = [ ]; users = [ ]; }
-    // (zipAttrsWith (_name: flatten) (filter (v: v.enable) (attrValues cfg)));
+  allPersistentStoragePaths = zipAttrsWith (_name: flatten) (filter (v: v.enable) (attrValues cfg));
   inherit (allPersistentStoragePaths) files directories;
   mountFile = pkgs.runCommand "impermanence-mount-file" { buildInputs = [ pkgs.bash ]; } ''
     cp ${./mount-file.bash} $out
     patchShebangs $out
   '';
+
+  defaultPerms = {
+    mode = "0755";
+    user = "root";
+    group = "root";
+  };
 
   # Create fileSystems bind mount entry.
   mkBindMountNameValuePair = { dirPath, persistentStoragePath, hideMount, ... }: {
@@ -83,7 +93,6 @@ in
             submodule
             nullOr
             path
-            either
             str
             coercedTo
             ;
@@ -92,11 +101,6 @@ in
           submodule (
             { name, config, ... }:
             let
-              defaultPerms = {
-                mode = "0755";
-                user = "root";
-                group = "root";
-              };
               commonOpts = {
                 options = {
                   persistentStoragePath = mkOption {
@@ -428,6 +432,14 @@ in
                       to.
                     '';
                   };
+
+                  enableWarnings = mkOption {
+                    type = bool;
+                    default = true;
+                    description = ''
+                      Enable non-critical warnings.
+                    '';
+                  };
                 };
               config =
                 let
@@ -477,7 +489,7 @@ in
     virtualisation.fileSystems = mkOption { };
   };
 
-  config = {
+  config = mkIf (allPersistentStoragePaths != { }) {
     systemd.services =
       let
         mkPersistFileService = { filePath, persistentStoragePath, enableDebugging, ... }:
@@ -511,9 +523,9 @@ in
       in
       foldl' recursiveUpdate { } (map mkPersistFileService files);
 
-    fileSystems = bindMounts;
+    fileSystems = mkIf (directories != [ ]) bindMounts;
     # So the mounts still make it into a VM built from `system.build.vm`
-    virtualisation.fileSystems = bindMounts;
+    virtualisation.fileSystems = mkIf (directories != [ ]) bindMounts;
 
     system.activationScripts =
       let
@@ -571,11 +583,6 @@ in
               foldl'
                 (state: dir:
                   let
-                    defaultPerms = {
-                      mode = "0755";
-                      user = "root";
-                      group = "root";
-                    };
                     homeDir = {
                       directory = dir.home;
                       dirPath = dir.home;
@@ -597,6 +604,29 @@ in
                 )
                 [ ]
                 explicitDirs;
+
+            # Persistent storage directories. These need to be created
+            # unless they're at the root of a filesystem.
+            persistentStorageDirs =
+              foldl'
+                (state: dir:
+                  let
+                    persistentStorageDir = {
+                      directory = dir.persistentStoragePath;
+                      dirPath = dir.persistentStoragePath;
+                      persistentStoragePath = "";
+                      home = null;
+                      inherit (dir) defaultPerms enableDebugging;
+                      inherit (dir.defaultPerms) user group mode;
+                    };
+                  in
+                  if dir.home == null && !(elem persistentStorageDir state) then
+                    state ++ [ persistentStorageDir ]
+                  else
+                    state
+                )
+                [ ]
+                (explicitDirs ++ homeDirs);
 
             # Generate entries for all parent directories of the
             # argument directories, listed in the order they need to
@@ -624,6 +654,8 @@ in
               in
               unique (flatten (map mkParents dirs));
 
+            persistentStorageDirParents = mkParentDirs persistentStorageDirs;
+
             # Parent directories of home folders. This is usually only
             # /home, unless the user's home is in a non-standard
             # location.
@@ -633,7 +665,13 @@ in
             parentDirs = mkParentDirs explicitDirs;
 
             # All directories in the order they should be created.
-            allDirs = homeDirParents ++ homeDirs ++ parentDirs ++ explicitDirs;
+            allDirs =
+              persistentStorageDirParents
+              ++ persistentStorageDirs
+              ++ homeDirParents
+              ++ homeDirs
+              ++ parentDirs
+              ++ explicitDirs;
           in
           pkgs.writeShellScript "impermanence-run-create-directories" ''
             _status=0
@@ -673,6 +711,70 @@ in
           deps = [ "createPersistentStorageDirs" ];
           text = "${persistFileScript}";
         };
+      };
+
+    # Create the mountpoints of directories marked as needed for boot
+    # which are also persisted. For this to work, it has to run at
+    # early boot, before NixOS' filesystem mounting runs. Without
+    # this, initial boot fails when for example /var/lib/nixos is
+    # persisted but not created in persistent storage.
+    boot.initrd =
+      let
+        neededForBootFs = catAttrs "mountPoint" (filter fsNeededForBoot (attrValues config.fileSystems));
+        neededForBootDirs = filter (dir: elem dir.dirPath neededForBootFs) directories;
+        getDevice = fs: if fs.device != null then fs.device else "/dev/disk/by-label/${fs.label}";
+        mkMount = fs:
+          let
+            mountPoint = concatPaths [ "/persist-tmp-mnt" fs.mountPoint ];
+            device = getDevice fs;
+            options = filter (o: (builtins.match "(x-.*\.mount)" o) == null) fs.options;
+            optionsFlag = optionalString (options != [ ]) ("-o " + escapeShellArg (concatStringsSep "," options));
+          in
+          ''
+            mkdir -p ${escapeShellArg mountPoint}
+            mount -t ${escapeShellArgs [ fs.fsType device mountPoint ]} ${optionsFlag}
+          '';
+        mkDir = { persistentStoragePath, dirPath, ... }: ''
+          mkdir -p ${escapeShellArg (concatPaths [ "/persist-tmp-mnt" persistentStoragePath dirPath ])}
+        '';
+        mkUnmount = fs: ''
+          umount ${escapeShellArg (concatPaths [ "/persist-tmp-mnt" fs.mountPoint ])}
+        '';
+        fileSystems =
+          let
+            persistentStoragePaths = unique (catAttrs "persistentStoragePath" directories);
+            all = config.fileSystems // config.virtualisation.fileSystems;
+            matchFileSystems = fs: attrValues (filterAttrs (_: v: v.mountPoint or null == fs) all);
+          in
+          concatMap matchFileSystems persistentStoragePaths;
+        deviceUnits = unique
+          (map
+            (fs:
+              if fs.fsType == "zfs" then
+                "zfs-import.target"
+              else
+                "${(escapeSystemdPath (getDevice fs))}.device")
+            fileSystems);
+        createNeededForBootDirs = ''
+          ${concatMapStrings mkMount fileSystems}
+          ${concatMapStrings mkDir neededForBootDirs}
+          ${concatMapStrings mkUnmount fileSystems}
+        '';
+      in
+      {
+        systemd.services = mkIf config.boot.initrd.systemd.enable {
+          create-needed-for-boot-dirs = {
+            wantedBy = [ "initrd-root-device.target" ];
+            requires = deviceUnits;
+            after = deviceUnits;
+            before = [ "sysroot.mount" ];
+            serviceConfig.Type = "oneshot";
+            unitConfig.DefaultDependencies = false;
+            script = createNeededForBootDirs;
+          };
+        };
+        postDeviceCommands = mkIf (!config.boot.initrd.systemd.enable)
+          (mkAfter createNeededForBootDirs);
       };
 
     assertions =
@@ -759,6 +861,41 @@ in
             '';
         }
       ];
+
+    warnings =
+      let
+        usersWithoutUid = attrNames (filterAttrs (n: u: u.uid == null) config.users.users);
+        groupsWithoutGid = attrNames (filterAttrs (n: g: g.gid == null) config.users.groups);
+        varLibNixosPersistent =
+          let
+            varDirs = parentsOf "/var/lib/nixos" ++ [ "/var/lib/nixos" ];
+            persistedDirs = catAttrs "dirPath" directories;
+            mountedDirs = catAttrs "mountPoint" (attrValues config.fileSystems);
+            persistedVarDirs = intersectLists varDirs persistedDirs;
+            mountedVarDirs = intersectLists varDirs mountedDirs;
+          in
+          persistedVarDirs != [ ] || mountedVarDirs != [ ];
+      in
+      mkIf (any id allPersistentStoragePaths.enableWarnings)
+        (mkMerge [
+          (mkIf (!varLibNixosPersistent && (usersWithoutUid != [ ] || groupsWithoutGid != [ ])) [
+            ''
+              environment.persistence:
+                  Neither /var/lib/nixos nor any of its parents are
+                  persisted. This means all users/groups without
+                  specified uids/gids will have them reassigned on
+                  reboot.
+                  ${optionalString (usersWithoutUid != [ ]) ''
+                  The following users are missing a uid:
+                        ${concatStringsSep "\n      " usersWithoutUid}
+                  ''}
+                  ${optionalString (groupsWithoutGid != [ ]) ''
+                  The following groups are missing a gid:
+                        ${concatStringsSep "\n      " groupsWithoutGid}
+                  ''}
+            ''
+          ])
+        ]);
   };
 
 }
